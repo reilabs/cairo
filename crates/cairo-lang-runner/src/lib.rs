@@ -1,10 +1,12 @@
 //! Basic runner for running a Sierra program on the vm.
+use std::any::Any;
 use std::collections::HashMap;
 
 use ark_std::iterable::Iterable;
 use cairo_felt::Felt252;
-use cairo_lang_casm::hints::Hint;
+use cairo_lang_casm::hints::{Hint, StarknetHint};
 use cairo_lang_casm::instructions::Instruction;
+use cairo_lang_casm::operand::{CellRef, Register, ResOperand};
 use cairo_lang_casm::{casm, casm_extend};
 use cairo_lang_sierra::extensions::bitwise::BitwiseType;
 use cairo_lang_sierra::extensions::core::{CoreConcreteLibfunc, CoreLibfunc, CoreType};
@@ -27,31 +29,210 @@ use cairo_lang_sierra_to_casm::metadata::{
 };
 use cairo_lang_sierra_type_size::{get_type_size_map, TypeSizeMap};
 use cairo_lang_starknet::contract::ContractInfo;
+use cairo_lang_utils::bigint::BigIntAsHex;
 use cairo_lang_utils::casts::IntoOrPanic;
 use cairo_lang_utils::extract_matches;
 use cairo_lang_utils::ordered_hash_map::OrderedHashMap;
 use cairo_lang_utils::unordered_hash_map::UnorderedHashMap;
-use cairo_vm::hint_processor::hint_processor_definition::HintProcessor;
+use cairo_vm::hint_processor::hint_processor_definition::{
+    HintProcessor, HintProcessorLogic, HintReference,
+};
 use cairo_vm::serde::deserialize_program::{BuiltinName, HintParams};
+use cairo_vm::types::errors::math_errors::MathError;
+use cairo_vm::types::exec_scope::ExecutionScopes;
+use cairo_vm::types::relocatable::Relocatable;
 use cairo_vm::vm::errors::cairo_run_errors::CairoRunError;
-use cairo_vm::vm::runners::cairo_runner::RunResources;
+use cairo_vm::vm::errors::hint_errors::HintError;
+use cairo_vm::vm::errors::vm_errors::VirtualMachineError;
+use cairo_vm::vm::runners::cairo_runner::{ResourceTracker, RunResources};
 use cairo_vm::vm::trace::trace_entry::TraceEntry;
 use cairo_vm::vm::vm_core::VirtualMachine;
-use casm_run::hint_to_hint_params;
+use casm_run::{execute_core_hint_base, hint_to_hint_params};
 pub use casm_run::{CairoHintProcessor, StarknetState};
 use itertools::chain;
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 use profiling::{user_function_idx_by_sierra_statement_idx, ProfilingInfo};
+use starknet_crypto::FieldElement;
 use thiserror::Error;
 
-use crate::casm_run::RunFunctionContext;
+use crate::casm_run::{extract_relocatable, vm_get_range, MemBuffer, RunFunctionContext};
 
 pub mod casm_run;
 pub mod profiling;
 pub mod short_string;
 
 const MAX_STACK_TRACE_DEPTH_DEFAULT: usize = 100;
+
+/// The `value: FieldElement` is `pub(crate)` and there is no accessor.
+/// This function converts a `Felt252` to a `FieldElement` using a safe, albeit inefficient,
+/// method.
+pub fn felt_to_field_element(felt: &Felt252) -> FieldElement {
+    let bytes = felt.to_bytes_be();
+    FieldElement::from_bytes_be(&bytes.try_into().unwrap()).unwrap()
+}
+
+pub fn field_element_to_felt(felt: &FieldElement) -> Felt252 {
+    let bytes = felt.to_bytes_be();
+    Felt252::from_bytes_be(&bytes)
+}
+
+pub trait StarknetHintProcessor: Sync {
+    fn matches_selector(&self, selector: &str) -> bool;
+
+    fn execute(
+        &self,
+        selector: &str,
+        input: &[FieldElement]
+    ) -> Vec<FieldElement>;
+}
+
+pub struct StarknetHintRegistryProcessor<'a> {
+    pub inner_processor: CairoHintProcessor<'a>,
+    pub cheatcodes: &'a[&'a dyn StarknetHintProcessor],
+}
+
+fn cell_ref_to_relocatable(
+    cell_ref: &CellRef,
+    vm: &VirtualMachine,
+) -> Result<Relocatable, MathError> {
+    let base = match cell_ref.register {
+        Register::AP => vm.get_ap(),
+        Register::FP => vm.get_fp(),
+    };
+    base + (cell_ref.offset as i32)
+}
+
+macro_rules! insert_value_to_cellref {
+    ($vm:ident, $cell_ref:ident, $value:expr) => {
+        // TODO: unwrap?
+        $vm.insert_value(cell_ref_to_relocatable($cell_ref, $vm).unwrap(), $value)
+    };
+}
+
+impl<'a> StarknetHintRegistryProcessor<'a> {
+    fn execute_cheatcode(
+        &mut self,
+        selector: &BigIntAsHex,
+        [input_start, input_end]: [&ResOperand; 2],
+        [output_start, output_end]: [&CellRef; 2],
+        vm: &mut VirtualMachine,
+        _exec_scopes: &mut ExecutionScopes,
+    ) -> Result<(), HintError> {
+        // Parse the selector.
+        let selector = &selector.value.to_bytes_be().1;
+        let selector = std::str::from_utf8(selector).map_err(|_| {
+            HintError::CustomHint(Box::from("failed to parse selector".to_string()))
+        })?;
+
+        println!("executing custom cheatcode {selector}");
+
+        let processor = self.cheatcodes.iter().find(|processor| processor.matches_selector(selector));
+        let output = if let Some(processor) = processor {
+            // Extract the inputs.
+            let input_start = extract_relocatable(vm, input_start)?;
+            let input_end = extract_relocatable(vm, input_end)?;
+            let inputs = vm_get_range(vm, input_start, input_end)?.iter().map(|felt|
+                felt_to_field_element(felt)
+            ).collect::<Vec<_>>();
+            let output = processor.execute(selector, &inputs);
+            output.iter().map(|felt| {
+                field_element_to_felt(felt)
+            }).collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        
+        println!("custom StarknetHintProcessor generated output {output:?}");
+
+        let mut res_segment = MemBuffer::new_segment(vm);
+        let res_segment_start = res_segment.ptr;
+        res_segment.write_data(output.iter())?;
+        let res_segment_end = res_segment.ptr;
+        insert_value_to_cellref!(vm, output_start, res_segment_start)?;
+        insert_value_to_cellref!(vm, output_end, res_segment_end)?;
+
+        Ok(())
+    }
+
+    fn starknet_state(&self) -> StarknetState {
+        self.inner_processor.starknet_state.clone()
+    }
+}
+
+impl<'a> HintProcessorLogic for StarknetHintRegistryProcessor<'a> {
+    // Ignores all data except for the code that should contain
+    fn compile_hint(
+        &self,
+        //Block of hint code as String
+        hint_code: &str,
+        //Ap Tracking Data corresponding to the Hint
+        ap_tracking_data: &cairo_vm::serde::deserialize_program::ApTracking,
+        //Map from variable name to reference id number
+        //(may contain other variables aside from those used by the hint)
+        reference_ids: &HashMap<String, usize>,
+        //List of all references (key corresponds to element of the previous dictionary)
+        references: &[HintReference],
+    ) -> Result<Box<dyn Any>, VirtualMachineError> {
+        self.inner_processor.compile_hint(hint_code, ap_tracking_data, reference_ids, references)
+    }
+
+    /// Trait function to execute a given hint in the hint processor.
+    fn execute_hint(
+        &mut self,
+        vm: &mut VirtualMachine,
+        exec_scopes: &mut ExecutionScopes,
+        hint_data: &Box<dyn Any>,
+        constants: &HashMap<String, Felt252>,
+    ) -> Result<(), HintError> {
+        let hint = hint_data.downcast_ref::<Hint>().unwrap();
+        let hint = match hint {
+            Hint::Core(core_hint_base) => {
+                return execute_core_hint_base(vm, exec_scopes, core_hint_base);
+            }
+            Hint::Starknet(hint) => hint,
+        };
+        match hint {
+            StarknetHint::SystemCall { system } => {
+                self.inner_processor.execute_hint(vm, exec_scopes, hint_data, constants)?;
+            }
+            StarknetHint::Cheatcode {
+                selector,
+                input_start,
+                input_end,
+                output_start,
+                output_end,
+            } => {
+                self.execute_cheatcode(
+                    selector,
+                    [input_start, input_end],
+                    [output_start, output_end],
+                    vm,
+                    exec_scopes,
+                )?;
+            }
+        };
+        Ok(())
+    }
+}
+
+impl<'a> ResourceTracker for StarknetHintRegistryProcessor<'a> {
+    fn consumed(&self) -> bool {
+        self.inner_processor.consumed()
+    }
+
+    fn consume_step(&mut self) {
+        self.inner_processor.consume_step()
+    }
+
+    fn get_n_steps(&self) -> Option<usize> {
+        self.inner_processor.get_n_steps()
+    }
+
+    fn run_resources(&self) -> &cairo_vm::vm::runners::cairo_runner::RunResources {
+        self.inner_processor.run_resources()
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum RunnerError {
@@ -203,6 +384,47 @@ impl SierraCasmRunner {
             casm_program,
             starknet_contracts_info,
             run_profiler,
+        })
+    }
+
+    /// Runs the vm starting from a function in the context of a given starknet state.
+    pub fn run_function_with_starknet_hint_processor(
+        &self,
+        func: &Function,
+        args: &[Arg],
+        available_gas: Option<usize>,
+        hint_registry: &[&dyn StarknetHintProcessor],
+    ) -> Result<RunResultStarknet, RunnerError> {
+        let initial_gas = self.get_initial_available_gas(func, available_gas)?;
+        let (entry_code, builtins) = self.create_entry_code(func, args, initial_gas)?;
+        let footer = Self::create_code_footer();
+        let (hints_dict, string_to_hint) =
+            build_hints_dict(chain!(&entry_code, &self.casm_program.instructions));
+        let assembled_program = self.casm_program.clone().assemble_ex(&entry_code, &footer);
+
+        let mut hint_processor = StarknetHintRegistryProcessor {
+            inner_processor: CairoHintProcessor {
+                runner: Some(self),
+                starknet_state: Default::default(),
+                string_to_hint,
+                run_resources: Default::default(),
+            },
+            cheatcodes: hint_registry,
+        };
+
+        let RunResult { gas_counter, memory, value, profiling_info } = self.run_function(
+            func,
+            &mut hint_processor,
+            hints_dict,
+            assembled_program.bytecode.iter(),
+            builtins,
+        )?;
+        Ok(RunResultStarknet {
+            gas_counter,
+            memory,
+            value,
+            starknet_state: hint_processor.starknet_state(),
+            profiling_info,
         })
     }
 
@@ -534,7 +756,11 @@ impl SierraCasmRunner {
             .funcs
             .iter()
             .find(|f| {
-                if let Some(name) = &f.id.debug_name { name.ends_with(name_suffix) } else { false }
+                if let Some(name) = &f.id.debug_name {
+                    name.ends_with(name_suffix)
+                } else {
+                    false
+                }
             })
             .ok_or_else(|| RunnerError::MissingFunction { suffix: name_suffix.to_owned() })
     }

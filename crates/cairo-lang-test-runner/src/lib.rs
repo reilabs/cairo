@@ -15,7 +15,10 @@ use cairo_lang_runner::casm_run::format_next_item;
 use cairo_lang_runner::profiling::{
     ProfilingInfo, ProfilingInfoProcessor, ProfilingInfoProcessorParams,
 };
-use cairo_lang_runner::{ProfilingInfoCollectionConfig, RunResultValue, SierraCasmRunner};
+use cairo_lang_runner::{
+    ProfilingInfoCollectionConfig, RunResultValue,
+    SierraCasmRunner, StarknetHintProcessor,
+};
 use cairo_lang_sierra::extensions::gas::CostTokenType;
 use cairo_lang_sierra::ids::FunctionId;
 use cairo_lang_sierra::program::{Program, StatementIdx};
@@ -31,7 +34,7 @@ use cairo_lang_utils::casts::IntoOrPanic;
 use cairo_lang_utils::ordered_hash_map::OrderedHashMap;
 use cairo_lang_utils::unordered_hash_map::UnorderedHashMap;
 use colored::Colorize;
-use itertools::Itertools;
+use itertools::{chain, Itertools};
 use num_traits::ToPrimitive;
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 
@@ -88,7 +91,7 @@ impl CompiledTestRunner {
     }
 
     /// Execute preconfigured test execution.
-    pub fn run(self, db: Option<&RootDatabase>) -> Result<Option<TestsSummary>> {
+    pub fn run_with_hints(self, db: Option<&RootDatabase>, hint_registry: &[&dyn StarknetHintProcessor]) -> Result<Option<TestsSummary>> {
         let (compiled, filtered_out) = filter_test_cases(
             self.compiled,
             self.config.include_ignored,
@@ -104,6 +107,7 @@ impl CompiledTestRunner {
             compiled.contracts_info,
             self.config.run_profiler != RunProfilerConfig::None,
             compiled.statements_functions,
+            hint_registry,
         )?;
 
         if failed.is_empty() {
@@ -137,6 +141,11 @@ impl CompiledTestRunner {
                 ignored.len()
             );
         }
+    }
+
+    /// Execute preconfigured test execution.
+    pub fn run(self, db: Option<&RootDatabase>) -> Result<Option<TestsSummary>> {
+        self.run_with_hints(db, &[])
     }
 }
 
@@ -297,6 +306,7 @@ pub fn run_tests(
     contracts_info: OrderedHashMap<Felt252, ContractInfo>,
     run_profiler: bool,
     statements_functions: UnorderedHashMap<StatementIdx, String>,
+    hint_registry: &[&dyn StarknetHintProcessor]
 ) -> Result<TestsSummary> {
     let runner = SierraCasmRunner::new(
         sierra_program.clone(),
@@ -324,7 +334,7 @@ pub fn run_tests(
     if db.is_none() {
         named_tests
             .into_par_iter()
-            .map(|(name, test)| run_single_test(test, name, &runner))
+            .map(|(name, test)| run_single_test(test, name, &runner, hint_registry))
             .for_each(|res| {
                 update_summary(
                     &wrapped_summary,
@@ -343,7 +353,7 @@ pub fn run_tests(
         eprintln!("Note: Tests don't run in parallel when running with a database.");
         named_tests
             .into_iter()
-            .map(move |(name, test)| run_single_test(test, name, &runner))
+            .map(move |(name, test)| run_single_test(test, name, &runner, hint_registry))
             .for_each(|test_result| {
                 update_summary(
                     &wrapped_summary,
@@ -364,13 +374,15 @@ fn run_single_test(
     test: TestConfig,
     name: String,
     runner: &SierraCasmRunner,
+    hint_registry: &[&dyn StarknetHintProcessor],
 ) -> anyhow::Result<(String, Option<TestResult>)> {
     if test.ignored {
         return Ok((name, None));
     }
     let func = runner.find_function(name.as_str())?;
+
     let result = runner
-        .run_function_with_starknet_context(func, &[], test.available_gas, Default::default())
+        .run_function_with_starknet_hint_processor(func, &[], test.available_gas, hint_registry)
         .with_context(|| format!("Failed to run the function `{}`.", name.as_str()))?;
     Ok((
         name,
