@@ -68,8 +68,11 @@ const MAX_STACK_TRACE_DEPTH_DEFAULT: usize = 100;
 /// This function converts a `Felt252` to a `FieldElement` using a safe, albeit inefficient,
 /// method.
 pub fn felt_to_field_element(felt: &Felt252) -> FieldElement {
-    let bytes = felt.to_bytes_be();
-    FieldElement::from_bytes_be(&bytes.try_into().unwrap()).unwrap()
+    let bytes = felt.to_be_bytes();
+    println!("converting {felt}, bytes len {}", bytes.len());
+    let result = FieldElement::from_bytes_be(&bytes).unwrap();
+    println!("result {result}");
+    result
 }
 
 pub fn field_element_to_felt(felt: &FieldElement) -> Felt252 {
@@ -132,6 +135,8 @@ impl<'a> StarknetHintRegistryProcessor<'a> {
             // Extract the inputs.
             let input_start = extract_relocatable(vm, input_start)?;
             let input_end = extract_relocatable(vm, input_end)?;
+            println!("executing custom cheatcode {selector}: input start/end");
+
             let inputs = vm_get_range(vm, input_start, input_end)?.iter().map(|felt|
                 felt_to_field_element(felt)
             ).collect::<Vec<_>>();
