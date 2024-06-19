@@ -13,6 +13,7 @@ use cairo_lang_sierra::ids::FunctionId;
 use cairo_lang_utils::bigint::BigIntAsHex;
 use cairo_lang_utils::byte_array::{BYTES_IN_WORD, BYTE_ARRAY_MAGIC};
 use cairo_lang_utils::extract_matches;
+use cairo_oracle::CairoOracle;
 use cairo_vm::hint_processor::hint_processor_definition::{
     HintProcessor, HintProcessorLogic, HintReference,
 };
@@ -1249,9 +1250,12 @@ impl<'a> CairoHintProcessor<'a> {
                     res_segment.write_data(payload.iter())?;
                 }
             }
-            _ => Err(HintError::CustomHint(Box::from(format!(
-                "Unknown cheatcode selector: {selector}"
-            ))))?,
+            _ => {
+                // TODO: this doesn't need to be initialized every time but it makes the diff smaller
+                let oracle = CairoOracle::new_from_env();
+                let result = oracle.execute_hint(selector, inputs.as_ref()).map_err(|err| HintError::CustomHint(err))?;
+                res_segment.write_data(result.iter())?;
+            },
         }
         let res_segment_end = res_segment.ptr;
         insert_value_to_cellref!(vm, output_start, res_segment_start)?;
