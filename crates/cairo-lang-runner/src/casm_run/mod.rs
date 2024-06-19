@@ -1248,8 +1248,10 @@ impl<'a> CairoHintProcessor<'a> {
                     res_segment.write_data(payload.iter())?;
                 }
             }
+            "vrf" => {
+            }
             _ => Err(HintError::CustomHint(Box::from(format!(
-                "Unknown cheatcode selector: {selector}"
+                "Unknown cheatcode selector: {selector}."
             ))))?,
         }
         let res_segment_end = res_segment.ptr;
