@@ -1249,6 +1249,10 @@ impl<'a> CairoHintProcessor<'a> {
                 }
             }
             "vrf" => {
+                res_segment.write(Felt252::from(42))?;
+            }
+            "print" => {
+                println!("executing hint {selector} with inputs: {inputs:?}");
             }
             _ => Err(HintError::CustomHint(Box::from(format!(
                 "Unknown cheatcode selector: {selector}."
