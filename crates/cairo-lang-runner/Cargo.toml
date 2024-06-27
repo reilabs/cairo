@@ -20,6 +20,7 @@ cairo-lang-sierra-to-casm = { path = "../cairo-lang-sierra-to-casm", version = "
 cairo-lang-sierra-type-size = { path = "../cairo-lang-sierra-type-size", version = "~2.6.3" }
 cairo-lang-starknet = { path = "../cairo-lang-starknet", version = "~2.6.3" }
 cairo-lang-utils = { path = "../cairo-lang-utils", version = "~2.6.3" }
+cairo-oracle.workspace = true
 cairo-vm.workspace = true
 itertools = { workspace = true, default-features = true }
 keccak.workspace = true
