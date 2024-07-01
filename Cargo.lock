@@ -1136,7 +1136,7 @@ dependencies = [
 [[package]]
 name = "cairo-oracle"
 version = "0.1.0"
-source = "git+https://github.com/reilabs/cairo-hints?branch=oracle#fe8887949f7f850e09085a2ebfd9dd499efef877"
+source = "git+https://github.com/reilabs/cairo-hints?branch=main#448a8fe2767bbe829bfb98dcc3f2dbba08d54833"
 dependencies = [
  "cairo-proto-serde",
  "indoc",
@@ -1150,7 +1150,7 @@ dependencies = [
 [[package]]
 name = "cairo-proto-serde"
 version = "0.1.0"
-source = "git+https://github.com/reilabs/cairo-hints?branch=oracle#fe8887949f7f850e09085a2ebfd9dd499efef877"
+source = "git+https://github.com/reilabs/cairo-hints?branch=main#448a8fe2767bbe829bfb98dcc3f2dbba08d54833"
 dependencies = [
  "num-traits 0.2.19",
  "serde",
@@ -3819,9 +3819,9 @@ dependencies = [
 
 [[package]]
 name = "starknet-types-core"
-version = "0.1.2"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4098ac4ad57621cc7ec133b80fe72814d2cc4bee63ca8e7be4450ba6f42a07e8"
+checksum = "ce6bacf0ba19bc721e518bc4bf389ff13daa8a7c5db5fd320600473b8aa9fcbd"
 dependencies = [
  "lambdaworks-crypto",
  "lambdaworks-math",
